@@ -9,6 +9,7 @@ services:
       - NO_TORCH_COMPILE=1
     env_file:
       - .env
+    command: ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl", "--cpu-offload", "--host", "0.0.0.0"]
     deploy:
       resources:
         reservations:
