@@ -399,6 +399,7 @@ def get_moshi_lm(
     dtype: torch.dtype = torch.bfloat16,
     delays=None,
     cpu_offload: bool = False,
+    lowvram: bool = False,
 ) -> LMModel:
     """Return a pretrained Moshi LM model.
 
@@ -410,12 +411,18 @@ def get_moshi_lm(
         delays: Optional custom delays configuration.
         cpu_offload: If True, offload model layers to CPU when GPU memory is
                      insufficient. Uses accelerate's device_map="auto".
+        lowvram: If True, use 4-bit quantization via bitsandbytes to reduce VRAM.
     """
     # Copy to avoid mutating a shared/global dict
     lm_kwargs = dict(_lm_kwargs)
     lm_kwargs["dep_q"] = 16
     if delays is not None:
         lm_kwargs["delays"] = delays
+
+    if lowvram and filename is not None:
+        return _get_moshi_lm_lowvram(
+            filename, copy_missing_weights, device, dtype, lm_kwargs
+        )
 
     if cpu_offload and filename is not None:
         return _get_moshi_lm_with_offload(
@@ -598,4 +605,86 @@ def _get_moshi_lm_with_offload(
 
     model.eval()
     model._is_offloaded = True
+    return model
+
+
+def _get_moshi_lm_lowvram(
+    filename: str | Path,
+    copy_missing_weights: bool,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    lm_kwargs: dict,
+) -> LMModel:
+    """Load Moshi LM with 4-bit quantization using bitsandbytes."""
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        raise ImportError(
+            "lowvram mode requires the 'bitsandbytes' package. "
+            "Install it with: pip install bitsandbytes"
+        )
+
+    filename = str(filename)
+    logger.info("[MODEL_LOAD] Loading model with 4-bit quantization (bitsandbytes)")
+    logger.info(f"[MODEL_LOAD] filename={filename}")
+
+    # 1. Initialize model on CPU
+    model = LMModel(device="cpu", dtype=dtype, **lm_kwargs)
+
+    # 2. Identify and replace Linear layers with Linear4bit
+    def replace_linear(m):
+        for name, child in m.named_children():
+            if isinstance(child, torch.nn.Linear):
+                new_layer = bnb.nn.Linear4bit(
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    compute_dtype=dtype,
+                    quant_type="nf4",
+                )
+                setattr(m, name, new_layer)
+            else:
+                replace_linear(child)
+
+    replace_linear(model)
+
+    # 3. Load state dict on CPU
+    state_dict = _load_lm_state_dict(filename, device="cpu")
+    model_sd = model.state_dict()
+    state_dict = _patch_lm_state_dict(
+        state_dict=state_dict,
+        model_sd=model_sd,
+        copy_missing_weights=copy_missing_weights,
+    )
+
+    # 4. Load weights. For bnb.nn.Linear4bit, we must NOT use assign=True 
+    # to allow the layer to handle quantization during loading.
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys:
+        logger.warning(
+            "Missing %d LM keys while loading %s (first 8: %s)",
+            len(incompatible.missing_keys),
+            filename,
+            incompatible.missing_keys[:8],
+        )
+    if incompatible.unexpected_keys:
+        logger.warning(
+            "Unexpected %d LM keys while loading %s (first 8: %s)",
+            len(incompatible.unexpected_keys),
+            filename,
+            incompatible.unexpected_keys[:8],
+        )
+
+    _materialize_meta_tensors(
+        model=model,
+        target_device=torch.device("cpu"),
+        copy_missing_weights=copy_missing_weights,
+    )
+
+    # 5. Move to target device
+    dev = torch.device(device) if isinstance(device, str) else device
+    model.to(device=dev)
+
+    model.eval()
+    model._is_offloaded = False
     return model

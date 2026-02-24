@@ -35,7 +35,7 @@ import tarfile
 import time
 import secrets
 import sys
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import aiohttp
 from aiohttp import web
@@ -78,6 +78,64 @@ def seed_all(seed):
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = False
+
+
+def apply_runtime_limits(
+    max_cpu_threads: Optional[int],
+    max_cpu_cores: Optional[int],
+    io_priority: str,
+) -> None:
+    """Apply lightweight process resource controls for laptop-friendly runs."""
+    if max_cpu_threads is not None:
+        torch.set_num_threads(max_cpu_threads)
+        # Keep interop threads bounded to avoid excess scheduling overhead.
+        torch.set_num_interop_threads(max(1, min(max_cpu_threads, 4)))
+        logger.info("Set torch CPU thread cap to %d.", max_cpu_threads)
+
+    if max_cpu_cores is None and io_priority == "normal":
+        return
+
+    try:
+        import psutil
+    except Exception as exc:
+        logger.warning("psutil unavailable, skipping OS-level limits: %s", exc)
+        return
+
+    process = psutil.Process(os.getpid())
+    if max_cpu_cores is not None:
+        total_cores = psutil.cpu_count(logical=True) or os.cpu_count() or max_cpu_cores
+        core_cap = max(1, min(max_cpu_cores, total_cores))
+        try:
+            process.cpu_affinity(list(range(core_cap)))
+            logger.info("Set process CPU core affinity cap to %d/%d logical cores.", core_cap, total_cores)
+        except Exception as exc:
+            logger.warning("Unable to set CPU affinity cap: %s", exc)
+
+    if io_priority == "normal":
+        return
+
+    try:
+        if os.name == "nt":
+            io_map = {
+                "low": getattr(psutil, "IOPRIO_LOW", None),
+                "verylow": getattr(psutil, "IOPRIO_VERYLOW", None),
+            }
+            io_value = io_map.get(io_priority)
+            if io_value is None:
+                logger.warning("I/O priority level '%s' unsupported on this platform.", io_priority)
+            else:
+                process.ionice(io_value)
+                logger.info("Set process I/O priority to %s.", io_priority)
+        else:
+            # For non-Windows platforms, lower class numbers are higher priority.
+            # class 3 (idle) is closest to a "very low" disk priority.
+            if io_priority == "verylow":
+                process.ionice(3)
+            else:
+                process.ionice(2)
+            logger.info("Set process I/O niceness to %s.", io_priority)
+    except Exception as exc:
+        logger.warning("Unable to set I/O priority: %s", exc)
 
 
 def wrap_with_system_tags(text: str) -> str:
@@ -165,13 +223,19 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False, enable_warmup: bool = True):
+                 save_voice_prompt_embeddings: bool = False, enable_warmup: bool = True,
+                 memory_guard: Optional[Callable[[], bool]] = None,
+                 io_poll_interval_s: float = 0.005,
+                 max_audio_buffer_seconds: float = 8.0):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
         self.enable_warmup = enable_warmup
+        self.memory_guard = memory_guard
+        self.io_poll_interval_s = io_poll_interval_s
+        self.max_audio_buffer_samples = max(0, int(max_audio_buffer_seconds * self.mimi.sample_rate))
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -180,6 +244,12 @@ class ServerState:
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
         )
+        self._default_lm_gen_params = {
+            "audio_temperature": float(self.lm_gen.temp),
+            "text_temperature": float(self.lm_gen.temp_text),
+            "audio_topk": int(self.lm_gen.top_k),
+            "text_topk": int(self.lm_gen.top_k_text),
+        }
         
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
@@ -236,18 +306,93 @@ class ServerState:
         peer_port = request.transport.get_extra_info("peername")[1]  # Port
         clog.log("info", f"Incoming connection from {peer}:{peer_port}")
 
-        # self.lm_gen.temp = float(request.query["audio_temperature"])
-        # self.lm_gen.temp_text = float(request.query["text_temperature"])
-        # self.lm_gen.top_k_text = max(1, int(request.query["text_topk"]))
-        # self.lm_gen.top_k = max(1, int(request.query["audio_topk"]))
+        if self.memory_guard is not None and not self.memory_guard():
+            clog.log("warning", "memory guard rejected a new session.")
+            await ws.close(code=1013, message=b"Server memory limit exceeded")
+            return ws
+
+        def _parse_query_float(name: str, default: float, min_value: float | None = None) -> float:
+            raw = request.query.get(name)
+            if raw is None or raw == "":
+                return default
+            try:
+                value = float(raw)
+            except ValueError:
+                clog.log("warning", f"Invalid {name}='{raw}', using default {default}.")
+                return default
+            if min_value is not None and value < min_value:
+                clog.log("warning", f"{name}={value} is below {min_value}, clamping.")
+                value = min_value
+            return value
+
+        def _parse_query_int(name: str, default: int, min_value: int | None = None) -> int:
+            raw = request.query.get(name)
+            if raw is None or raw == "":
+                return default
+            try:
+                value = int(raw)
+            except ValueError:
+                clog.log("warning", f"Invalid {name}='{raw}', using default {default}.")
+                return default
+            if min_value is not None and value < min_value:
+                clog.log("warning", f"{name}={value} is below {min_value}, clamping.")
+                value = min_value
+            return value
+
+        def _parse_optional_seed(name: str) -> int | None:
+            raw = request.query.get(name)
+            if raw is None or raw == "":
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                clog.log("warning", f"Invalid {name}='{raw}', ignoring.")
+                return None
+
+        self.lm_gen.temp = _parse_query_float(
+            "audio_temperature",
+            self._default_lm_gen_params["audio_temperature"],
+            min_value=0.0,
+        )
+        self.lm_gen.temp_text = _parse_query_float(
+            "text_temperature",
+            self._default_lm_gen_params["text_temperature"],
+            min_value=0.0,
+        )
+        self.lm_gen.top_k = _parse_query_int(
+            "audio_topk",
+            self._default_lm_gen_params["audio_topk"],
+            min_value=0,
+        )
+        self.lm_gen.top_k_text = _parse_query_int(
+            "text_topk",
+            self._default_lm_gen_params["text_topk"],
+            min_value=0,
+        )
+
+        seed = _parse_optional_seed("seed")
+        if seed is None:
+            audio_seed = _parse_optional_seed("audio_seed")
+            text_seed = _parse_optional_seed("text_seed")
+            if audio_seed is not None:
+                seed = audio_seed
+                if text_seed is not None and text_seed != audio_seed:
+                    clog.log(
+                        "info",
+                        f"Received different text_seed ({text_seed}) and audio_seed ({audio_seed}); using audio_seed.",
+                    )
+            else:
+                seed = text_seed
+
+        text_prompt = request.query.get("text_prompt", "")
+        voice_prompt_filename = request.query.get("voice_prompt", "")
         
         # Construct full voice prompt path
         requested_voice_prompt_path = None
         voice_prompt_path = None
         if self.voice_prompt_dir is not None:
-            voice_prompt_filename = request.query["voice_prompt"]
             requested_voice_prompt_path = None
-            if voice_prompt_filename is not None:
+            if voice_prompt_filename:
                 requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
             # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
             if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
@@ -258,13 +403,16 @@ class ServerState:
                 voice_prompt_path = requested_voice_prompt_path
                 
         if self.lm_gen.voice_prompt != voice_prompt_path:
-            if voice_prompt_path.endswith('.pt'):
+            if voice_prompt_path is not None and voice_prompt_path.endswith('.pt'):
                 # Load pre-saved voice prompt embeddings
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
-            else:
+            elif voice_prompt_path is not None:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = int(request["seed"]) if "seed" in request.query else None
+        self.lm_gen.text_prompt_tokens = (
+            self.text_tokenizer.encode(wrap_with_system_tags(text_prompt))
+            if len(text_prompt) > 0
+            else None
+        )
 
         async def recv_loop():
             nonlocal close
@@ -299,11 +447,15 @@ class ServerState:
 
         async def opus_loop():
             all_pcm_data = None
+            last_drop_log = 0.0
 
             while True:
                 if close:
                     return
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(self.io_poll_interval_s)
+                if self.memory_guard is not None and not self.memory_guard():
+                    clog.log("warning", "memory guard closed the active session.")
+                    return
                 pcm = opus_reader.read_pcm()
                 if pcm.shape[-1] == 0:
                     continue
@@ -311,23 +463,51 @@ class ServerState:
                     all_pcm_data = pcm
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
+                if (
+                    self.max_audio_buffer_samples > 0
+                    and all_pcm_data.shape[-1] > self.max_audio_buffer_samples
+                ):
+                    overflow = all_pcm_data.shape[-1] - self.max_audio_buffer_samples
+                    all_pcm_data = all_pcm_data[overflow:]
+                    now = time.time()
+                    if now - last_drop_log > 5:
+                        last_drop_log = now
+                        clog.log(
+                            "warning",
+                            f"audio buffer exceeded limit, dropped {overflow} samples.",
+                        )
                 while all_pcm_data.shape[-1] >= self.frame_size:
                     be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
+                    
+                    t0 = time.time()
                     codes = self.mimi.encode(chunk)
                     _ = self.other_mimi.encode(chunk)
+                    t_enc = (time.time() - t0) * 1000
+                    
                     for c in range(codes.shape[-1]):
+                        t1 = time.time()
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        t_lm = (time.time() - t1) * 1000
+                        
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                        
+                        t2 = time.time()
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
                         _ = self.other_mimi.decode(tokens[:, 1:9])
+                        t_dec = (time.time() - t2) * 1000
+                        
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
+                        
+                        if random.random() < 0.02: # Log ~once per 4 seconds (12.5 fps)
+                             clog.log("info", f"Step Latency: {t_enc:.1f}ms (enc) | {t_lm:.1f}ms (lm) | {t_dec:.1f}ms (dec) | Total: {(time.time()-be)*1000:.1f}ms")
+                        
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
@@ -341,15 +521,15 @@ class ServerState:
             while True:
                 if close:
                     return
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(self.io_poll_interval_s)
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
                     await ws.send_bytes(b"\x01" + msg)
 
         clog.log("info", "accepted connection")
-        if len(request.query["text_prompt"]) > 0:
-            clog.log("info", f"text prompt: {request.query['text_prompt']}")
-        if len(request.query["voice_prompt"]) > 0:
+        if len(text_prompt) > 0:
+            clog.log("info", f"text prompt: {text_prompt}")
+        if len(voice_prompt_filename) > 0:
             clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
         close = False
         async with self.lock:
@@ -436,6 +616,10 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
 
 def _get_static_path(static: Optional[str]) -> Optional[str]:
     if static is None:
+        local_dist = Path(__file__).resolve().parents[2] / "client" / "dist"
+        if local_dist.exists():
+            logger.info(f"using local static content from {local_dist}")
+            return str(local_dist)
         logger.info("retrieving the static content")
         dist_tgz = hf_hub_download("nvidia/personaplex-7b-v1", "dist.tgz")
         dist_tgz = Path(dist_tgz)
@@ -470,6 +654,57 @@ def main():
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
     parser.add_argument(
+        "--max-cpu-threads",
+        type=int,
+        default=None,
+        help="Cap torch CPU worker threads (e.g. 4).",
+    )
+    parser.add_argument(
+        "--max-cpu-cores",
+        type=int,
+        default=None,
+        help="Pin process to first N logical CPU cores.",
+    )
+    parser.add_argument(
+        "--io-priority",
+        type=str,
+        choices=("normal", "low", "verylow"),
+        default="normal",
+        help="Lower process disk I/O priority to reduce system impact.",
+    )
+    parser.add_argument(
+        "--max-system-ram-percent",
+        type=float,
+        default=None,
+        help="Abort new work when total system RAM usage is above this percent.",
+    )
+    parser.add_argument(
+        "--max-process-ram-gb",
+        type=float,
+        default=None,
+        help="Abort new work when this server process exceeds RSS in GB.",
+    )
+    parser.add_argument(
+        "--io-poll-ms",
+        type=float,
+        default=5.0,
+        help="Polling interval for websocket I/O loops in milliseconds (higher lowers CPU usage).",
+    )
+    parser.add_argument(
+        "--max-audio-buffer-seconds",
+        type=float,
+        default=8.0,
+        help="Cap buffered input audio to prevent memory growth under load.",
+    )
+    parser.add_argument(
+        "--low-resource",
+        action="store_true",
+        help=(
+            "Laptop-friendly preset: disable warmup, disable compile/cuda graph, "
+            "lower I/O priority, and apply conservative CPU/RAM defaults."
+        ),
+    )
+    parser.add_argument(
         "--disable-warmup",
         action="store_true",
         help="Skip model warmup during startup.",
@@ -491,8 +726,43 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    parser.add_argument(
+        "--lowvram",
+        action="store_true",
+        help="Use 4-bit quantization via bitsandbytes to reduce VRAM usage.",
+    )
 
     args = parser.parse_args()
+    if args.max_cpu_threads is not None and args.max_cpu_threads < 1:
+        parser.error("--max-cpu-threads must be >= 1")
+    if args.max_cpu_cores is not None and args.max_cpu_cores < 1:
+        parser.error("--max-cpu-cores must be >= 1")
+    if args.max_system_ram_percent is not None and not (0 < args.max_system_ram_percent <= 100):
+        parser.error("--max-system-ram-percent must be in (0, 100]")
+    if args.max_process_ram_gb is not None and args.max_process_ram_gb <= 0:
+        parser.error("--max-process-ram-gb must be > 0")
+    if args.io_poll_ms <= 0:
+        parser.error("--io-poll-ms must be > 0")
+    if args.max_audio_buffer_seconds <= 0:
+        parser.error("--max-audio-buffer-seconds must be > 0")
+
+    if args.low_resource:
+        args.disable_warmup = True
+        os.environ.setdefault("NO_TORCH_COMPILE", "1")
+        os.environ.setdefault("NO_CUDA_GRAPH", "1")
+        cpu_count = os.cpu_count() or 4
+        if args.max_cpu_threads is None:
+            args.max_cpu_threads = max(1, cpu_count // 2)
+        if args.max_cpu_cores is None:
+            args.max_cpu_cores = max(1, cpu_count // 2)
+        if args.max_system_ram_percent is None:
+            args.max_system_ram_percent = 85.0
+        if args.io_priority == "normal":
+            args.io_priority = "verylow"
+        if args.max_audio_buffer_seconds > 4.0:
+            args.max_audio_buffer_seconds = 4.0
+        args.io_poll_ms = max(args.io_poll_ms, 5.0)
+
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
@@ -507,15 +777,32 @@ def main():
         f"Static path does not exist: {static_path}."
     logger.info(f"static_path = {static_path}")
     args.device = torch_auto_device(args.device)
+    apply_runtime_limits(args.max_cpu_threads, args.max_cpu_cores, args.io_priority)
 
     seed_all(42424242)
 
     # --- Safety Safeguards ---
-    def check_memory_safeguard(threshold_percent=80):
+    def check_memory_safeguard() -> bool:
         import psutil
+        threshold_percent = args.max_system_ram_percent
+        if threshold_percent is None:
+            threshold_percent = 90 if os.name == "nt" else 80
         mem = psutil.virtual_memory()
+        process = psutil.Process(os.getpid())
+        rss_gb = process.memory_info().rss / (1024 ** 3)
         if mem.percent > threshold_percent:
-            logger.error(f"CRITICAL: System RAM usage at {mem.percent}%. Triggering emergency stop.")
+            logger.error(
+                "CRITICAL: System RAM usage at %.1f%% exceeds cap %.1f%%.",
+                mem.percent,
+                threshold_percent,
+            )
+            return False
+        if args.max_process_ram_gb is not None and rss_gb > args.max_process_ram_gb:
+            logger.error(
+                "CRITICAL: Process RSS %.2f GB exceeds cap %.2f GB.",
+                rss_gb,
+                args.max_process_ram_gb,
+            )
             return False
         return True
 
@@ -523,9 +810,12 @@ def main():
         raise TimeoutError("Model initialization/warmup stalled.")
 
     import signal
-    signal.signal(signal.SIGALRM, timeout_handler)
-    if os.name != 'nt':
-        signal.alarm(300) # 5-minute timeout for warmup
+    alarm_supported = hasattr(signal, "SIGALRM") and os.name != "nt"
+    if alarm_supported:
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(300)  # 5-minute timeout for warmup
+    else:
+        logger.info("SIGALRM unavailable on this platform; skipping warmup timeout alarm.")
 
     if not check_memory_safeguard():
         sys.exit(1)
@@ -555,6 +845,9 @@ def main():
     mimi = loaders.get_mimi(args.mimi_weight, args.device)
     other_mimi = loaders.get_mimi(args.mimi_weight, args.device)
     logger.info("mimi loaded")
+    if not check_memory_safeguard():
+        logger.error("Memory cap exceeded after loading Mimi. Exiting.")
+        sys.exit(1)
 
     if args.tokenizer is None:
         args.tokenizer = hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME)
@@ -563,9 +856,17 @@ def main():
     logger.info("loading moshi")
     if args.moshi_weight is None:
         args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
-    lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
+    lm = loaders.get_moshi_lm(
+        args.moshi_weight,
+        device=args.device,
+        cpu_offload=args.cpu_offload,
+        lowvram=args.lowvram,
+    )
     lm.eval()
     logger.info("moshi loaded")
+    if not check_memory_safeguard():
+        logger.error("Memory cap exceeded after loading Moshi. Exiting.")
+        sys.exit(1)
     state = ServerState(
         mimi=mimi,
         other_mimi=other_mimi,
@@ -575,13 +876,19 @@ def main():
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
         enable_warmup=not args.disable_warmup,
+        memory_guard=check_memory_safeguard,
+        io_poll_interval_s=args.io_poll_ms / 1000.0,
+        max_audio_buffer_seconds=args.max_audio_buffer_seconds,
     )
     logger.info("warming up the model")
     warmup_ok = state.warmup()
     if not warmup_ok:
         logger.warning("[WARMUP] Warmup skipped or failed; continuing server startup.")
-    if os.name != 'nt':
-        signal.alarm(0) # Disable timeout alarm
+    if not check_memory_safeguard():
+        logger.error("Memory cap exceeded after warmup. Exiting.")
+        sys.exit(1)
+    if alarm_supported:
+        signal.alarm(0)  # Disable timeout alarm
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
     if static_path is not None:
@@ -602,6 +909,13 @@ def main():
     if setup_tunnel is not None:
         tunnel = setup_tunnel('localhost', args.port, tunnel_token, None)
         logger.info(f"Tunnel started, if executing on a remote GPU, you can use {tunnel}.")
+    if args.ssl is None and args.host not in ("localhost", "127.0.0.1"):
+        logger.warning("-" * 40)
+        logger.warning("[WARNING] HTTPS is not enabled.")
+        logger.warning("[WARNING] Secure contexts are required for microphone access in most browsers.")
+        logger.warning("[WARNING] Consider using --ssl or accessing via localhost.")
+        logger.warning("-" * 40)
+
     web.run_app(app, port=args.port, ssl_context=ssl_context)
 
 

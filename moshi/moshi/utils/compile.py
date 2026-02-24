@@ -32,14 +32,38 @@ Finally, provides some utilities for CUDA graphing functions.
 from contextlib import contextmanager
 from functools import wraps
 import inspect
+import logging
 import os
 import typing as tp
 
 import torch
 from torch import cuda
 
+try:
+    from torch._dynamo.exc import BackendCompilerFailed
+except Exception:  # pragma: no cover - import path may vary across torch versions
+    BackendCompilerFailed = tuple()  # type: ignore[assignment]
+
+
+logger = logging.getLogger(__name__)
+
 
 _compile_disabled: bool = False
+_ENV_FALSE_VALUES = {"", "0", "false", "f", "no", "n", "off"}
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in _ENV_FALSE_VALUES
+
+
+def _format_exception_one_line(exc: Exception) -> str:
+    text = str(exc).strip()
+    if not text:
+        return exc.__class__.__name__
+    return text.splitlines()[0]
 
 
 @contextmanager
@@ -59,18 +83,64 @@ def torch_compile_lazy(fun):
     """torch.compile creates a huge pool of processes, even when not using the function at all,
     e.g. with Dora. This can polute stderr when doing CTRL+C. So we do it in a lazy way.
     """
-    if os.environ.get("NO_TORCH_COMPILE"):
+    if not hasattr(torch, "compile"):
+        return fun
+    # torch.compile + CUDA is typically not usable on Windows unless a custom stack
+    # is prepared. Keep eager by default there to avoid runtime Triton failures.
+    if os.name == "nt" and not _env_flag("ALLOW_TORCH_COMPILE_ON_WINDOWS"):
         return fun
     fun_compiled = None
+    compile_failed = False
+    failure_logged = False
+
+    def _should_fallback(exc: Exception) -> bool:
+        if BackendCompilerFailed and isinstance(exc, BackendCompilerFailed):
+            return True
+        text = str(exc).lower()
+        markers = (
+            "torch._dynamo",
+            "torch._inductor",
+            "backendcompilerfailed",
+            "triton",
+            "cannot find a working triton installation",
+        )
+        return any(marker in text for marker in markers)
 
     @wraps(fun)
     def _wrapped(*args, **kwargs):
-        nonlocal fun_compiled
-        if _compile_disabled:
+        nonlocal fun_compiled, compile_failed, failure_logged
+        if _compile_disabled or compile_failed or _env_flag("NO_TORCH_COMPILE"):
             return fun(*args, **kwargs)
         if fun_compiled is None:
-            fun_compiled = torch.compile(fun)
-        return fun_compiled(*args, **kwargs)
+            try:
+                fun_compiled = torch.compile(fun)
+            except Exception as exc:
+                if _should_fallback(exc):
+                    compile_failed = True
+                    if not failure_logged:
+                        logger.warning(
+                            "torch.compile unavailable for %s (%s). Falling back to eager mode.",
+                            fun.__qualname__,
+                            _format_exception_one_line(exc),
+                        )
+                        failure_logged = True
+                    return fun(*args, **kwargs)
+                raise
+        try:
+            return fun_compiled(*args, **kwargs)
+        except Exception as exc:
+            if _should_fallback(exc):
+                compile_failed = True
+                fun_compiled = None
+                if not failure_logged:
+                    logger.warning(
+                        "Compiled execution failed for %s (%s). Falling back to eager mode.",
+                        fun.__qualname__,
+                        _format_exception_one_line(exc),
+                    )
+                    failure_logged = True
+                return fun(*args, **kwargs)
+            raise
 
     return _wrapped
 

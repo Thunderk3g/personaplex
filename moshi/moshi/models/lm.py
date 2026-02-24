@@ -736,8 +736,7 @@ class LMGen(StreamingModule[_LMGenState]):
             dtype=torch.bool
         )
 
-        disable = lm_model.device.type != 'cuda'
-        # disable = True # DEBUG
+        disable = lm_model.device.type != 'cuda' or getattr(lm_model, '_is_offloaded', False)
         graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable)
         graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)

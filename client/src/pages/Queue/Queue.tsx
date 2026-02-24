@@ -36,6 +36,7 @@ const TEXT_PROMPT_PRESETS = [
 
 interface HomepageProps {
   showMicrophoneAccessMessage: boolean;
+  audioInitError: string | null;
   startConnection: () => Promise<void>;
   textPrompt: string;
   setTextPrompt: (value: string) => void;
@@ -46,6 +47,7 @@ interface HomepageProps {
 const Homepage = ({
   startConnection,
   showMicrophoneAccessMessage,
+  audioInitError,
   textPrompt,
   setTextPrompt,
   voicePrompt,
@@ -118,6 +120,9 @@ const Homepage = ({
         {showMicrophoneAccessMessage && (
           <p className="text-center text-red-500">Please enable your microphone before proceeding</p>
         )}
+        {audioInitError && (
+          <p className="text-center text-red-500">{audioInitError}</p>
+        )}
         
         <Button onClick={async () => await startConnection()}>Connect</Button>
     </div>
@@ -131,6 +136,7 @@ export const Queue:FC = () => {
   const overrideWorkerAddr = searchParams.get("worker_addr");
   const [hasMicrophoneAccess, setHasMicrophoneAccess] = useState<boolean>(false);
   const [showMicrophoneAccessMessage, setShowMicrophoneAccessMessage] = useState<boolean>(false);
+  const [audioInitError, setAudioInitError] = useState<string | null>(null);
   const modelParams = useModelParams();
 
   const audioContext = useRef<AudioContext | null>(null);
@@ -161,7 +167,7 @@ export const Queue:FC = () => {
     return false;
 }, [setHasMicrophoneAccess, setShowMicrophoneAccessMessage]);
 
-  const startProcessor = useCallback(async () => {
+  const startProcessor = useCallback(async (): Promise<boolean> => {
     if(!audioContext.current) {
       audioContext.current = new AudioContext();
       // Prewarm decoder worker as soon as we have audio context
@@ -169,21 +175,40 @@ export const Queue:FC = () => {
       prewarmDecoderWorker(audioContext.current.sampleRate);
     }
     if(worklet.current) {
-      return;
+      setAudioInitError(null);
+      return true;
     }
-    let ctx = audioContext.current;
-    ctx.resume();
+    const ctx = audioContext.current;
+    await ctx.resume();
+
+    if (!ctx.audioWorklet || typeof ctx.audioWorklet.addModule !== "function") {
+      const reason = window.isSecureContext
+        ? "AudioWorklet is unavailable in this browser."
+        : "AudioWorklet requires a secure context. Use https:// or open via localhost.";
+      console.error(reason);
+      setAudioInitError(reason);
+      return false;
+    }
+
     try {
-      worklet.current = new AudioWorkletNode(ctx, 'moshi-processor');
-    } catch (err) {
       await ctx.audioWorklet.addModule(moshiProcessorUrl);
       worklet.current = new AudioWorkletNode(ctx, 'moshi-processor');
+    } catch (err) {
+      const reason = `Failed to initialize audio processor: ${String(err)}`;
+      console.error(reason);
+      setAudioInitError(reason);
+      return false;
     }
     worklet.current.connect(ctx.destination);
+    setAudioInitError(null);
+    return true;
   }, [audioContext, worklet]);
 
   const startConnection = useCallback(async() => {
-      await startProcessor();
+      const processorReady = await startProcessor();
+      if (!processorReady) {
+        return;
+      }
       const hasAccess = await getMicrophoneAccess();
       if (hasAccess) {
       // Values are already set in modelParams, they get passed to Conversation
@@ -205,6 +230,7 @@ export const Queue:FC = () => {
         <Homepage
           startConnection={startConnection}
           showMicrophoneAccessMessage={showMicrophoneAccessMessage}
+          audioInitError={audioInitError}
           textPrompt={modelParams.textPrompt}
           setTextPrompt={modelParams.setTextPrompt}
           voicePrompt={modelParams.voicePrompt}

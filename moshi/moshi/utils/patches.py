@@ -88,12 +88,14 @@ def apply_meta_tensor_patch():
         # If RoPE is used, ensure each layer has its own instance to avoid device affinity issues
         if pos_emb_type in {"rope", "sin_rope"}:
             for layer in self.layers:
-                # Get the device of the layer's parameters
-                try:
-                    p = next(layer.parameters())
-                    dev, dtype = p.device, p.dtype
-                except StopIteration:
-                    dev, dtype = torch.device("cpu"), torch.float32
+                # Get the device of the layer's parameters, fall back to CPU if all are meta
+                dev = torch.device("cpu")
+                dtype = torch.float32
+                for p in layer.parameters():
+                    if p.device.type != "meta":
+                        dev = p.device
+                        dtype = p.dtype
+                        break
                 
                 # Assign a fresh RoPE instance to each layer
                 layer.self_attn.rope = RotaryEmbedding(max_period=max_period).to(
