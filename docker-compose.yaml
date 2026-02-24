@@ -10,9 +10,10 @@ services:
       - TORCH_COMPILE_DISABLE=1
       - TORCHINDUCTOR_MAX_AUTOTUNE=0
       - TORCHINDUCTOR_COMPILE_THREADS=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     env_file:
       - .env
-    command: ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl", "--cpu-offload", "--host", "0.0.0.0"]
+    command: ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl", "--host", "0.0.0.0", "--lowvram"]
     deploy:
       resources:
         limits:

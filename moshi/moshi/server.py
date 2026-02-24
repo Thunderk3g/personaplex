@@ -216,19 +216,18 @@ def _register_meta_guard_hooks(model: torch.nn.Module) -> list[torch.utils.hooks
 @dataclass
 class ServerState:
     mimi: MimiModel
-    other_mimi: MimiModel
+    mimi: MimiModel
     text_tokenizer: sentencepiece.SentencePieceProcessor
     lm_gen: LMGen
     lock: asyncio.Lock
 
-    def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
+    def __init__(self, mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
                  save_voice_prompt_embeddings: bool = False, enable_warmup: bool = True,
                  memory_guard: Optional[Callable[[], bool]] = None,
                  io_poll_interval_s: float = 0.005,
                  max_audio_buffer_seconds: float = 8.0):
         self.mimi = mimi
-        self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
@@ -253,7 +252,6 @@ class ServerState:
         
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
-        self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
     
     def warmup(self):
@@ -485,7 +483,6 @@ class ServerState:
                     
                     t0 = time.time()
                     codes = self.mimi.encode(chunk)
-                    _ = self.other_mimi.encode(chunk)
                     t_enc = (time.time() - t0) * 1000
                     
                     for c in range(codes.shape[-1]):
@@ -499,7 +496,6 @@ class ServerState:
                         
                         t2 = time.time()
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        _ = self.other_mimi.decode(tokens[:, 1:9])
                         t_dec = (time.time() - t2) * 1000
                         
                         main_pcm = main_pcm.cpu()
