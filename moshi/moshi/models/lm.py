@@ -391,8 +391,21 @@ class LMModel(StreamingContainer):
 
     @property
     def device(self):
-        first_param = next(iter(self.parameters()))
-        return first_param.device
+        first_device: torch.device | None = None
+        for param in self.parameters():
+            first_device = param.device
+            if param.device.type != "meta":
+                return param.device
+        if first_device is not None:
+            return first_device
+
+        for buffer in self.buffers():
+            if buffer.device.type != "meta":
+                return buffer.device
+            if first_device is None:
+                first_device = buffer.device
+
+        return first_device or torch.device("cpu")
 
     @property
     def num_codebooks(self) -> int:
@@ -701,17 +714,25 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
+        # Fallback to current module's parameter device if lm_model.device is still meta
+        device = lm_model.device
+        if device.type == 'meta':
+            try:
+                device = next(lm_model.parameters()).device
+            except StopIteration:
+                device = torch.device('cpu')
+
         initial = lm_model._get_initial_token()
         cache = torch.full(
             (batch_size, self.lm_model.num_codebooks, self.max_delay + 3),
             lm_model.ungenerated_token_id,
-            device=lm_model.device,
+            device=device,
             dtype=torch.long,
         )
         provided = torch.full(
             (batch_size, self.lm_model.num_codebooks, self.max_delay + 3),
             False,
-            device=lm_model.device,
+            device=device,
             dtype=torch.bool
         )
 

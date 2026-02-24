@@ -13,6 +13,7 @@ dependencies = [
     "torch >= 2.2.0, < 2.5",
     "aiohttp>=3.10.5, <3.11",
     "accelerate",
+    "psutil",
 ]
 authors = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
 maintainers = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]

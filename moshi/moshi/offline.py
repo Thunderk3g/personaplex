@@ -42,8 +42,10 @@ keep parity with voice-prompt feeding logic in the server.
 import argparse
 import os
 import tarfile
+import time
 from pathlib import Path
 import json
+from collections.abc import Iterator
 from typing import Optional, List
 
 import numpy as np
@@ -90,24 +92,100 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
-def warmup(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, device: str, frame_size: int):
+def _iter_tensors(obj) -> Iterator[torch.Tensor]:
+    if isinstance(obj, torch.Tensor):
+        yield obj
+    elif isinstance(obj, (tuple, list)):
+        for item in obj:
+            yield from _iter_tensors(item)
+    elif isinstance(obj, dict):
+        for item in obj.values():
+            yield from _iter_tensors(item)
+
+
+def _register_meta_guard_hooks(model: torch.nn.Module) -> list[torch.utils.hooks.RemovableHandle]:
+    """Attach temporary warmup hooks that fail early on unresolved meta tensors."""
+    hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+    def _make_hook(module_name: str):
+        def _hook(module: torch.nn.Module, args):
+            input_device = "unknown"
+            for tensor in _iter_tensors(args):
+                input_device = str(tensor.device)
+                break
+
+            for param_name, param in module.named_parameters(recurse=False):
+                if param.device.type == "meta":
+                    log(
+                        "error",
+                        (
+                            "[FORWARD_FAIL] module="
+                            f"{module_name}({module.__class__.__name__}) "
+                            f"param={param_name} input_device={input_device} weight_device={param.device}"
+                        ),
+                    )
+                    raise RuntimeError(
+                        f"Meta tensor detected in {module_name}.{param_name} during warmup forward pass."
+                    )
+        return _hook
+
+    for name, module in model.named_modules():
+        if not any(True for _ in module.parameters(recurse=False)):
+            continue
+        hooks.append(module.register_forward_pre_hook(_make_hook(name)))
+    return hooks
+
+
+def warmup(
+    mimi: MimiModel,
+    other_mimi: MimiModel,
+    lm_gen: LMGen,
+    device: str,
+    frame_size: int,
+    enable_warmup: bool = True,
+) -> bool:
     """Run a short warmup loop to initialize CUDA graphs and streaming state.
 
     Replicates the same warmup behavior as server.py: zeros → encode → LMGen.step → decode.
     """
-    for _ in range(4):
-        chunk = torch.zeros(1, 1, frame_size, dtype=torch.float32, device=device)
-        codes = mimi.encode(chunk)
-        _ = other_mimi.encode(chunk)
-        for c in range(codes.shape[-1]):
-            tokens = lm_gen.step(codes[:, :, c : c + 1])
-            if tokens is None:
-                continue
-            # Decode agent audio channels to ensure decode graphs/states are primed
-            _ = mimi.decode(tokens[:, 1:9])
-            _ = other_mimi.decode(tokens[:, 1:9])
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if not enable_warmup:
+        log("info", "[WARMUP] Skipped: warmup disabled by configuration.")
+        return False
+
+    log("info", "[WARMUP] Starting validation phase...")
+    if not loaders.validate_no_meta_tensors(lm_gen.lm_model):
+        log("error", "[WARMUP] Aborting warmup gracefully. Model is not fully materialized.")
+        return False
+
+    hooks = _register_meta_guard_hooks(lm_gen.lm_model)
+    log("info", "[WARMUP] Entering forward passes...")
+
+    try:
+        for step in range(1, 5):
+            start_time = time.time()
+            chunk = torch.zeros(1, 1, frame_size, dtype=torch.float32, device=device)
+            codes = mimi.encode(chunk)
+            _ = other_mimi.encode(chunk)
+            for c in range(codes.shape[-1]):
+                tokens = lm_gen.step(codes[:, :, c : c + 1])
+                if tokens is None:
+                    continue
+                # Decode agent audio channels to ensure decode graphs/states are primed
+                _ = mimi.decode(tokens[:, 1:9])
+                _ = other_mimi.decode(tokens[:, 1:9])
+            duration = int((time.time() - start_time) * 1000)
+            log("info", f"[WARMUP] step={step} completed in {duration}ms")
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return True
+    except Exception as exc:
+        log("error", f"[WARMUP] Fatal error during warmup: {exc}")
+        return False
+    finally:
+        for hook in hooks:
+            hook.remove()
+        log("info", "[WARMUP] Hooks removed. Warmup sequence concluded.")
 
 
 def decode_tokens_to_pcm(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, tokens: torch.Tensor) -> np.ndarray:
@@ -168,6 +246,7 @@ def run_inference(
     topk_text: int,
     greedy: bool,
     save_voice_prompt_embeddings: bool,
+    enable_warmup: bool = True,
     cpu_offload: bool = False,
 ):
     """Run offline inference using an input WAV as the user-side stream.
@@ -229,7 +308,9 @@ def run_inference(
 
     # 5) Warmup
     log("info", "warming up the model")
-    warmup(mimi, other_mimi, lm_gen, device, frame_size)
+    warmup_ok = warmup(mimi, other_mimi, lm_gen, device, frame_size, enable_warmup=enable_warmup)
+    if not warmup_ok:
+        log("warning", "[WARMUP] Warmup skipped or failed; continuing inference.")
 
     # 6) Prompt configuration (text + voice)
     # System text tokens (k=0) and agent voice-prompt audio (k=1..dep_q) are forced
@@ -380,6 +461,11 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
+    parser.add_argument(
+        "--disable-warmup",
+        action="store_true",
+        help="Skip model warmup before inference.",
+    )
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
 
     args = parser.parse_args()
@@ -423,6 +509,7 @@ def main():
             topk_text=args.topk_text,
             greedy=greedy,
             save_voice_prompt_embeddings=False,
+            enable_warmup=not args.disable_warmup,
             cpu_offload=args.cpu_offload,
         )
 

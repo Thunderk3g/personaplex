@@ -126,6 +126,235 @@ def _is_safetensors(path: Path | str) -> bool:
     return Path(path).suffix in (".safetensors", ".sft", ".sfts")
 
 
+def _load_lm_state_dict(
+    filename: str,
+    device: torch.device | str = "cpu",
+) -> dict[str, torch.Tensor]:
+    if filename.endswith(".safetensors"):
+        dev = torch.device(device) if isinstance(device, str) else device
+        # safetensors does not support mps directly
+        load_device = "cpu" if dev.type == "mps" else dev.type
+        return load_file(filename, device=load_device)
+    with open(filename, "rb") as f:
+        return torch.load(f, map_location=device)
+
+
+def _get_expanded_source_name(name: str) -> str | None:
+    to_replace = ["gating", "linears", "depformer_in", "depformer_emb"]
+    for old_idx, new_idx in zip(range(8), range(8, 16)):
+        for rep in to_replace:
+            needle = f"{rep}.{new_idx}."
+            if needle in name:
+                return name.replace(needle, f"{rep}.{old_idx}.")
+    return None
+
+
+def _repeat_first_dim_to_shape(
+    source: torch.Tensor,
+    target_shape: torch.Size,
+) -> torch.Tensor | None:
+    if tuple(source.shape) == tuple(target_shape):
+        return source.clone()
+    if source.dim() != len(target_shape):
+        return None
+    if source.dim() > 1 and tuple(source.shape[1:]) != tuple(target_shape[1:]):
+        return None
+    if source.shape[0] <= 0:
+        return None
+    repeats = (target_shape[0] + source.shape[0] - 1) // source.shape[0]
+    if repeats <= 0:
+        return None
+    rep_dims = (repeats,) + (1,) * (source.dim() - 1)
+    expanded = source.repeat(rep_dims)
+    return expanded[: target_shape[0]].clone()
+
+
+def _patch_lm_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    model_sd: dict[str, torch.Tensor],
+    copy_missing_weights: bool,
+) -> dict[str, torch.Tensor]:
+    # Patch 1: expand depformer self_attn tensors when checkpoint was saved with fewer depformer steps.
+    for name, tensor in list(state_dict.items()):
+        if "depformer" in name and "self_attn" in name and name in model_sd:
+            target_shape = model_sd[name].shape
+            if tensor.shape != target_shape:
+                expanded = _repeat_first_dim_to_shape(tensor, target_shape)
+                if expanded is not None:
+                    logger.info(
+                        "Expanding %s from %s to %s",
+                        name,
+                        tuple(tensor.shape),
+                        tuple(target_shape),
+                    )
+                    state_dict[name] = expanded
+                else:
+                    logger.warning(
+                        "Could not expand %s from %s to %s",
+                        name,
+                        tuple(tensor.shape),
+                        tuple(target_shape),
+                    )
+
+    # Patch 2: fill missing module-list entries by copying 0..7 -> 8..15.
+    if copy_missing_weights:
+        for name, target_tensor in model_sd.items():
+            if name in state_dict:
+                continue
+            source_name = _get_expanded_source_name(name)
+            if source_name is None or source_name not in state_dict:
+                continue
+            source_tensor = state_dict[source_name]
+            patched = _repeat_first_dim_to_shape(source_tensor, target_tensor.shape)
+            if patched is None:
+                logger.warning(
+                    "Could not copy missing key %s from %s due to shape mismatch %s vs %s",
+                    name,
+                    source_name,
+                    tuple(source_tensor.shape),
+                    tuple(target_tensor.shape),
+                )
+                continue
+            state_dict[name] = patched
+            logger.info("Replacing %s <- %s", name, source_name)
+
+    return state_dict
+
+
+def _find_parent_real_device(model: torch.nn.Module, parent_name: str) -> torch.device | None:
+    parent = model if parent_name == "" else model.get_submodule(parent_name)
+    for p in parent.parameters(recurse=False):
+        if p.device.type != "meta":
+            return p.device
+    for b in parent.buffers(recurse=False):
+        if b.device.type != "meta":
+            return b.device
+    return None
+
+
+def _set_tensor_on_module(
+    model: torch.nn.Module,
+    full_name: str,
+    value: torch.Tensor,
+    is_parameter: bool,
+) -> None:
+    if "." in full_name:
+        parent_name, tensor_name = full_name.rsplit(".", 1)
+        parent = model.get_submodule(parent_name)
+    else:
+        parent = model
+        tensor_name = full_name
+
+    if is_parameter:
+        old_param = parent._parameters[tensor_name]
+        parent._parameters[tensor_name] = torch.nn.Parameter(
+            value, requires_grad=old_param.requires_grad
+        )
+    else:
+        parent._buffers[tensor_name] = value
+
+
+def _materialize_meta_tensors(
+    model: torch.nn.Module,
+    target_device: torch.device,
+    copy_missing_weights: bool,
+) -> None:
+    params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+
+    def _materialize(name: str, tensor: torch.Tensor, is_parameter: bool) -> None:
+        if tensor.device.type != "meta":
+            return
+
+        source_name = _get_expanded_source_name(name) if copy_missing_weights else None
+        source_tensor = None
+        if source_name is not None:
+            source_tensor = params.get(source_name)
+            if source_tensor is None:
+                source_tensor = buffers.get(source_name)
+
+        value = None
+        device = None
+        if source_tensor is not None and source_tensor.device.type != "meta":
+            device = source_tensor.device
+            source_cast = source_tensor.to(device=device, dtype=tensor.dtype)
+            value = _repeat_first_dim_to_shape(source_cast, tensor.shape)
+
+        if value is None:
+            parent_name = name.rsplit(".", 1)[0] if "." in name else ""
+            device = _find_parent_real_device(model, parent_name) or target_device
+            value = torch.zeros(tensor.shape, device=device, dtype=tensor.dtype)
+            logger.warning("Materializing missing tensor %s with zeros on %s", name, device)
+
+        _set_tensor_on_module(model, name, value, is_parameter=is_parameter)
+        if is_parameter:
+            params[name] = model.get_parameter(name)
+        else:
+            buffers[name] = model.get_buffer(name)
+
+    for name, param in list(model.named_parameters()):
+        _materialize(name, param, is_parameter=True)
+    for name, buf in list(model.named_buffers()):
+        _materialize(name, buf, is_parameter=False)
+
+    meta_params = [n for n, p in model.named_parameters() if p.device.type == "meta"]
+    meta_buffers = [n for n, b in model.named_buffers() if b.device.type == "meta"]
+    if meta_params or meta_buffers:
+        preview = (meta_params + meta_buffers)[:8]
+        raise RuntimeError(
+            f"Found unresolved meta tensors after materialization: {preview}"
+        )
+
+
+def _count_named_tensor_devices(
+    named_tensors: list[tuple[str, torch.Tensor]],
+) -> tuple[dict[str, int], list[str]]:
+    counts: dict[str, int] = {}
+    meta_names: list[str] = []
+    for name, tensor in named_tensors:
+        dev_type = tensor.device.type
+        counts[dev_type] = counts.get(dev_type, 0) + 1
+        if dev_type == "meta":
+            meta_names.append(name)
+    return counts, meta_names
+
+
+def get_model_device_summary(
+    model: torch.nn.Module,
+) -> tuple[dict[str, int], dict[str, int], list[str], list[str]]:
+    """Return parameter and buffer device counts plus unresolved meta tensor names."""
+    param_counts, meta_params = _count_named_tensor_devices(list(model.named_parameters()))
+    buffer_counts, meta_buffers = _count_named_tensor_devices(list(model.named_buffers()))
+    return param_counts, buffer_counts, meta_params, meta_buffers
+
+
+def validate_no_meta_tensors(
+    model: torch.nn.Module,
+    *,
+    log_prefix: str = "[PARAM_CHECK]",
+    log_missing_examples: int = 8,
+) -> bool:
+    """Log device placement summary and return False if unresolved meta tensors remain."""
+    param_counts, buffer_counts, meta_params, meta_buffers = get_model_device_summary(model)
+    logger.info(
+        "%s params=%s buffers=%s",
+        log_prefix,
+        param_counts,
+        buffer_counts,
+    )
+    if not meta_params and not meta_buffers:
+        return True
+
+    logger.error(
+        "[ERROR] Meta tensors detected after model load (%d params, %d buffers).",
+        len(meta_params),
+        len(meta_buffers),
+    )
+    preview = (meta_params + meta_buffers)[:log_missing_examples]
+    logger.error("[ERROR] Examples: %s", ", ".join(preview))
+    return False
+
+
 def get_mimi(filename: str | Path,
              device: torch.device | str = 'cpu') -> MimiModel:
     """Return a pretrained Mimi model."""
@@ -193,6 +422,10 @@ def get_moshi_lm(
             filename, copy_missing_weights, device, dtype, lm_kwargs
         )
 
+    logger.info("[MODEL_LOAD] moshi initialized")
+    logger.info(f"[MODEL_LOAD] target_device={device}")
+    logger.info(f"[MODEL_LOAD] dtype={dtype}")
+
     # Init with meta device to avoid init dummy memory
     init_device = "meta" if filename is not None else device
     model = LMModel(device=init_device, dtype=dtype, **lm_kwargs)
@@ -203,60 +436,43 @@ def get_moshi_lm(
 
     filename = str(filename)
 
-    # Load state_dict
-    if filename.endswith(".safetensors"):
-        # safetensors does not support mps directly
-        dev = torch.device(device) if isinstance(device, str) else device
-        if dev.type == "mps":
-            state_dict = load_file(filename, device="cpu")
-        else:
-            state_dict = load_file(filename, device=dev.type)
-    else:
-        # torch checkpoint
-        with open(filename, "rb") as f:
-            state_dict = torch.load(f, map_location="cpu")
-    # Patch 1: expand depformer self_attn weights if needed
+    # Load and patch state_dict on CPU before moving to the target device.
+    state_dict = _load_lm_state_dict(filename, device="cpu")
     model_sd = model.state_dict()
-    for name, tensor in list(state_dict.items()):
-        if "depformer" in name and "self_attn" in name and name in model_sd:
-            if tensor.shape != model_sd[name].shape:
-                print("Expanding %s", name)
-                missing = (
-                    tensor
-                    if copy_missing_weights
-                    else model_sd[name][tensor.shape[0] :]
-                )
-                state_dict[name] = torch.concat([tensor, missing], dim=0)
-
-    # Patch 2: fill missing keys by copying 0..7 -> 8..15 for certain groups
-    if copy_missing_weights:
-        to_replace = ["gating", "linears", "depformer_in", "depformer_emb"]
-        for name in model_sd.keys():
-            if name in state_dict:
-                continue
-            replaced = False
-            for old, new in zip(range(8), range(8, 16)):
-                for rep in to_replace:
-                    needle = f"{rep}.{new}."
-                    if needle in name:
-                        src = name.replace(needle, f"{rep}.{old}.")
-                        if src in state_dict:
-                            print("Replacing %s <- %s", name, src)
-                            state_dict[name] = state_dict[src]
-                            replaced = True
-                        break
-                if replaced:
-                    break
-            if not replaced:
-                print("Missing %s", name)
+    state_dict = _patch_lm_state_dict(
+        state_dict=state_dict,
+        model_sd=model_sd,
+        copy_missing_weights=copy_missing_weights,
+    )
 
     # Assign weights to target device
     dev = torch.device(device) if isinstance(device, str) else device
     for key in state_dict:
         state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
-    
-    model.load_state_dict(state_dict, strict=False, assign=True)
+
+    incompatible = model.load_state_dict(state_dict, strict=False, assign=True)
+    if incompatible.missing_keys:
+        logger.warning(
+            "Missing %d LM keys while loading %s (first 8: %s)",
+            len(incompatible.missing_keys),
+            filename,
+            incompatible.missing_keys[:8],
+        )
+    if incompatible.unexpected_keys:
+        logger.warning(
+            "Unexpected %d LM keys while loading %s (first 8: %s)",
+            len(incompatible.unexpected_keys),
+            filename,
+            incompatible.unexpected_keys[:8],
+        )
+
+    _materialize_meta_tensors(
+        model=model,
+        target_device=dev,
+        copy_missing_weights=copy_missing_weights,
+    )
     model.eval()
+    model._is_offloaded = False
     return model.to(device=device, dtype=dtype)
 
 
@@ -274,15 +490,23 @@ def _get_moshi_lm_with_offload(
     and moved to GPU only during forward pass.
     """
     try:
-        from accelerate import init_empty_weights, load_checkpoint_and_dispatch, infer_auto_device_map, dispatch_model
+        from accelerate import init_empty_weights, infer_auto_device_map, dispatch_model
+        import accelerate
     except ImportError:
         raise ImportError(
             "CPU offloading requires the 'accelerate' package. "
-            "Install it with: pip install accelerate"
+            "Install it with: pip install <accelerate>"
         )
 
     filename = str(filename)
-    logger.info("Loading model with CPU offloading enabled (Accelerate)")
+    logger.info("[MODEL_LOAD] Loading model with CPU offloading enabled (Accelerate)")
+    logger.info(f"[MODEL_LOAD] filename={filename}")
+    logger.info(f"[MODEL_LOAD] target_device={device}")
+    logger.info(f"[MODEL_LOAD] Torch version: {torch.__version__}")
+    try:
+        logger.info(f"[MODEL_LOAD] Accelerate version: {accelerate.__version__}")
+    except Exception:
+        pass
 
     # 1. Create model on meta device to save RAM
     with init_empty_weights():
@@ -293,11 +517,35 @@ def _get_moshi_lm_with_offload(
     if dev.type != "cuda":
         logger.info(f"CPU offload requested but device is {dev}, skipping offload")
         model = LMModel(device=dev, dtype=dtype, **lm_kwargs)
-        if filename.endswith(".safetensors"):
-            state_dict = load_file(filename, device=dev.type)
-        else:
-            state_dict = torch.load(filename, map_location=dev)
-        model.load_state_dict(state_dict, strict=False, assign=True)
+        model_sd = model.state_dict()
+        state_dict = _load_lm_state_dict(filename, device="cpu")
+        state_dict = _patch_lm_state_dict(
+            state_dict=state_dict,
+            model_sd=model_sd,
+            copy_missing_weights=copy_missing_weights,
+        )
+        for key in state_dict:
+            state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
+        incompatible = model.load_state_dict(state_dict, strict=False, assign=True)
+        if incompatible.missing_keys:
+            logger.warning(
+                "Missing %d LM keys while loading %s (first 8: %s)",
+                len(incompatible.missing_keys),
+                filename,
+                incompatible.missing_keys[:8],
+            )
+        if incompatible.unexpected_keys:
+            logger.warning(
+                "Unexpected %d LM keys while loading %s (first 8: %s)",
+                len(incompatible.unexpected_keys),
+                filename,
+                incompatible.unexpected_keys[:8],
+            )
+        _materialize_meta_tensors(
+            model=model,
+            target_device=dev,
+            copy_missing_weights=copy_missing_weights,
+        )
         model.eval()
         return model
 
@@ -310,23 +558,44 @@ def _get_moshi_lm_with_offload(
         dtype=dtype,
     )
 
-    # 4. Load and dispatch
-    # load_checkpoint_and_dispatch will load the weights layer by layer if possible
-    # or at least much more efficiently than loading the full dict.
+    # 4. Load on CPU, patch shape/key mismatches, and then dispatch per the inferred device map.
     logger.info(f"Dispatching model with device_map: {device_map}")
-    
-    # NOTE: Since the current weights file might not have the expanded depformer weights,
-    # we might still need to handle the patching. However, load_checkpoint_and_dispatch
-    # usually expects the file to match. If it fails, we will fall back to a more manual approach.
-    
-    model = load_checkpoint_and_dispatch(
-        model,
-        filename,
-        device_map=device_map,
-        no_split_module_classes=["StreamingTransformerLayer"],
-        dtype=dtype,
-        strict=False,
+
+    model_sd = model.state_dict()
+    state_dict = _load_lm_state_dict(filename, device="cpu")
+    state_dict = _patch_lm_state_dict(
+        state_dict=state_dict,
+        model_sd=model_sd,
+        copy_missing_weights=copy_missing_weights,
+    )
+    for key in state_dict:
+        state_dict[key] = state_dict[key].to(dtype=dtype)
+
+    incompatible = model.load_state_dict(state_dict, strict=False, assign=True)
+    if incompatible.missing_keys:
+        logger.warning(
+            "Missing %d LM keys while loading %s (first 8: %s)",
+            len(incompatible.missing_keys),
+            filename,
+            incompatible.missing_keys[:8],
+        )
+    if incompatible.unexpected_keys:
+        logger.warning(
+            "Unexpected %d LM keys while loading %s (first 8: %s)",
+            len(incompatible.unexpected_keys),
+            filename,
+            incompatible.unexpected_keys[:8],
+        )
+
+    _materialize_meta_tensors(
+        model=model,
+        target_device=torch.device("cpu"),
+        copy_missing_weights=copy_missing_weights,
     )
 
+    model = dispatch_model(model, device_map=device_map)
+    validate_no_meta_tensors(model, log_prefix="[POST_DISPATCH]")
+
     model.eval()
+    model._is_offloaded = True
     return model

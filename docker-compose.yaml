@@ -7,12 +7,18 @@ services:
       - "8998:8998"
     environment:
       - NO_TORCH_COMPILE=1
+      - TORCH_COMPILE_DISABLE=1
+      - TORCHINDUCTOR_MAX_AUTOTUNE=0
+      - TORCHINDUCTOR_COMPILE_THREADS=1
     env_file:
       - .env
     command: ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl", "--cpu-offload", "--host", "0.0.0.0"]
     deploy:
       resources:
+        limits:
+          memory: 16G
         reservations:
+          memory: 12G
           devices:
             - driver: nvidia
               count: 1

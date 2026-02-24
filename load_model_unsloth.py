@@ -13,7 +13,19 @@ Prerequisites:
 
 import torch
 import os
+import psutil
+import signal
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+# --- Technical Safeguards for RTX 3050 (4GB) ---
+# 1. Global Inductor Suppression
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["TORCHINDUCTOR_MAX_AUTOTUNE"] = "0"
+os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+
+# 2. Prevent TorchDynamo from attempting compilation
+if hasattr(torch, "_dynamo"):
+    torch._dynamo.config.suppress_errors = True
 try:
     from unsloth import FastLanguageModel
     UNSLOTH_AVAILABLE = True
@@ -39,6 +51,33 @@ if torch.cuda.is_available():
         print("GPU does not support bfloat16 - using float16.")
         DTYPE = torch.float16
 
+# --- Memory & Timeout Safeguards ---
+def check_memory_safeguard(threshold_percent=80):
+    """Proactive OOM monitoring logic."""
+    mem = psutil.virtual_memory()
+    if mem.percent > threshold_percent:
+        print(f"CRITICAL: System RAM usage at {mem.percent}%. Triggering emergency stop to prevent SIGSEGV.")
+        return False
+    return True
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("Model initialization/Step 0 stalled (likely Inductor hang).")
+
+def apply_unsloth_fixes(model):
+    """Ensure torch.compile is never called on the model object."""
+    if hasattr(model, "compile"):
+        print("Safeguard: Bypassing torch.compile for stability.")
+        model.compile = lambda *args, **kwargs: model
+    return model
+
+def apply_meta_tensor_patch():
+    """Apply stability patches to handle meta tensors correctly."""
+    try:
+        from moshi.utils.patches import apply_meta_tensor_patch as patch
+        patch()
+    except ImportError:
+        print("Warning: Could not apply stability patches (moshi.utils.patches not found).")
+
 def load_model():
     """
     Attempts to load the model using Unsloth for maximum speed/efficiency.
@@ -57,7 +96,8 @@ def load_model():
                 # token = os.getenv("HF_TOKEN") # Uncomment if using gated models
             )
             
-            # Enable 2x faster inference
+            # Enable 2x faster inference (Ensure compile is bypassed)
+            model = apply_unsloth_fixes(model)
             FastLanguageModel.for_inference(model)
             print("Successfully loaded model using Unsloth!")
             return model, tokenizer
@@ -109,8 +149,23 @@ def run_dummy_inference(model, tokenizer):
     print("Dummy inference completed successfully!")
 
 if __name__ == "__main__":
+    # Set a 5-minute timeout for initialization
+    signal.signal(signal.SIGALRM, timeout_handler)
+    if os.name != 'nt': # signal.alarm is not available on Windows, but this is for Linux container
+        signal.alarm(300) 
+
     try:
+        # Check RAM before loading
+        if not check_memory_safeguard():
+            exit(1)
+
+        apply_meta_tensor_patch()
         model, tokenizer = load_model()
+        
+        # Disable alarm on success
+        if os.name != 'nt':
+            signal.alarm(0)
+
         run_dummy_inference(model, tokenizer)
         print("\nAll systems go. Your model is ready for inference or fine-tuning.")
     except Exception as e:

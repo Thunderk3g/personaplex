@@ -26,6 +26,7 @@
 
 import argparse
 import asyncio
+from collections.abc import Iterator
 from dataclasses import dataclass
 import random
 import os
@@ -43,12 +44,15 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
-import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+from .utils.patches import apply_meta_tensor_patch
+
+# Apply stability patches before model loading
+apply_meta_tensor_patch()
 
 
 logger = setup_logger(__name__)
@@ -86,6 +90,71 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
+def _iter_tensors(obj) -> Iterator[torch.Tensor]:
+    if isinstance(obj, torch.Tensor):
+        yield obj
+    elif isinstance(obj, (tuple, list)):
+        for item in obj:
+            yield from _iter_tensors(item)
+    elif isinstance(obj, dict):
+        for item in obj.values():
+            yield from _iter_tensors(item)
+
+
+def _register_meta_guard_hooks(model: torch.nn.Module) -> list[torch.utils.hooks.RemovableHandle]:
+    """Attach temporary warmup hooks that fail early on unresolved meta tensors."""
+    hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+    def _make_hook(module_name: str):
+        def _hook(module: torch.nn.Module, args):
+            try:
+                # Check input devices
+                input_device = "unknown"
+                for tensor in _iter_tensors(args):
+                    input_device = str(tensor.device)
+                    break
+
+                # Check parameters and buffers
+                for name, param in module.named_parameters(recurse=False):
+                    if param.device.type == "meta":
+                        logger.error(
+                            "[FORWARD_FAIL] module=%s(%s) param=%s input_device=%s weight_device=%s",
+                            module_name,
+                            module.__class__.__name__,
+                            name,
+                            input_device,
+                            param.device,
+                        )
+                        raise RuntimeError(
+                            f"Meta tensor detected in {module_name}.{name} during warmup forward pass."
+                        )
+                
+                for name, buf in module.named_buffers(recurse=False):
+                    if buf.device.type == "meta":
+                        logger.error(
+                            "[FORWARD_FAIL] module=%s(%s) buffer=%s input_device=%s weight_device=%s",
+                            module_name,
+                            module.__class__.__name__,
+                            name,
+                            input_device,
+                            buf.device,
+                        )
+                        raise RuntimeError(
+                            f"Meta tensor detected in {module_name}.{name} (buffer) during warmup forward pass."
+                        )
+            except Exception as e:
+                if not isinstance(e, RuntimeError) or "Meta tensor detected" not in str(e):
+                    logger.error(f"[FORWARD_FAIL] Unexpected error in hook for {module_name}: {str(e)}")
+                raise e
+        return _hook
+
+    for name, module in model.named_modules():
+        if not any(True for _ in module.parameters(recurse=False)):
+            continue
+        hooks.append(module.register_forward_pre_hook(_make_hook(name)))
+    return hooks
+
+
 @dataclass
 class ServerState:
     mimi: MimiModel
@@ -96,12 +165,13 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False, enable_warmup: bool = True):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.enable_warmup = enable_warmup
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -117,19 +187,45 @@ class ServerState:
         self.lm_gen.streaming_forever(1)
     
     def warmup(self):
-        for _ in range(4):
-            chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
-            codes = self.mimi.encode(chunk)
-            _ = self.other_mimi.encode(chunk)
-            for c in range(codes.shape[-1]):
-                tokens = self.lm_gen.step(codes[:, :, c: c + 1])
-                if tokens is None:
-                    continue
-                _ = self.mimi.decode(tokens[:, 1:9])
-                _ = self.other_mimi.decode(tokens[:, 1:9])
+        if not self.enable_warmup:
+            logger.info("[WARMUP] Skipped: warmup disabled by configuration.")
+            return False
 
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
+        logger.info("[WARMUP] Starting validation phase...")
+        if not loaders.validate_no_meta_tensors(self.lm_gen.lm_model):
+            logger.error("[WARMUP] Aborting warmup gracefully. Model is not fully materialized.")
+            return False
+
+        hooks = _register_meta_guard_hooks(self.lm_gen.lm_model)
+        logger.info("[WARMUP] Entering forward passes...")
+
+        try:
+            for step in range(1, 5):
+                start_time = time.time()
+                chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
+                logger.info(f"[WARMUP] step={step} input_shape={tuple(chunk.shape)} device={self.device}")
+                
+                codes = self.mimi.encode(chunk)
+                _ = self.other_mimi.encode(chunk)
+                for c in range(codes.shape[-1]):
+                    tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                    if tokens is None:
+                        continue
+                    _ = self.mimi.decode(tokens[:, 1:9])
+                    _ = self.other_mimi.decode(tokens[:, 1:9])
+                duration = int((time.time() - start_time) * 1000)
+                logger.info("[WARMUP] step=%d completed in %dms", step, duration)
+
+            if torch.device(self.device).type == 'cuda':
+                torch.cuda.synchronize()
+            return True
+        except Exception:
+            logger.exception("[WARMUP] Fatal error during warmup.")
+            return False
+        finally:
+            for hook in hooks:
+                hook.remove()
+            logger.info("[WARMUP] Hooks removed. Warmup sequence concluded.")
 
 
     async def handle_chat(self, request):
@@ -374,6 +470,11 @@ def main():
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
     parser.add_argument(
+        "--disable-warmup",
+        action="store_true",
+        help="Skip model warmup during startup.",
+    )
+    parser.add_argument(
         "--voice-prompt-dir",
         type=str,
         help=(
@@ -408,6 +509,26 @@ def main():
     args.device = torch_auto_device(args.device)
 
     seed_all(42424242)
+
+    # --- Safety Safeguards ---
+    def check_memory_safeguard(threshold_percent=80):
+        import psutil
+        mem = psutil.virtual_memory()
+        if mem.percent > threshold_percent:
+            logger.error(f"CRITICAL: System RAM usage at {mem.percent}%. Triggering emergency stop.")
+            return False
+        return True
+
+    def timeout_handler(signum, frame):
+        raise TimeoutError("Model initialization/warmup stalled.")
+
+    import signal
+    signal.signal(signal.SIGALRM, timeout_handler)
+    if os.name != 'nt':
+        signal.alarm(300) # 5-minute timeout for warmup
+
+    if not check_memory_safeguard():
+        sys.exit(1)
 
     setup_tunnel = None
     tunnel_token = ''
@@ -453,9 +574,14 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        enable_warmup=not args.disable_warmup,
     )
     logger.info("warming up the model")
-    state.warmup()
+    warmup_ok = state.warmup()
+    if not warmup_ok:
+        logger.warning("[WARMUP] Warmup skipped or failed; continuing server startup.")
+    if os.name != 'nt':
+        signal.alarm(0) # Disable timeout alarm
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
     if static_path is not None:
