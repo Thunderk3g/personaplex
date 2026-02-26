@@ -472,6 +472,7 @@ class LMModel(StreamingContainer):
         depformer_cb_index: int,
         sequence: torch.Tensor,
         transformer_out: torch.Tensor,
+        skip_transfer: bool = False,
     ) -> torch.Tensor:
         B, K, S = sequence.shape
         assert (
@@ -710,6 +711,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_audio: Optional[torch.Tensor] = None
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
+        self.prewarmed_states: dict[tuple[str | None, str | None], tuple[torch.Tensor, torch.Tensor, int]] = {}
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
@@ -1146,6 +1148,31 @@ class LMGen(StreamingModule[_LMGenState]):
         for _ in self._step_text_prompt_core():
             if is_alive is not None and not await is_alive():
                 break
+
+    def save_prewarmed_state(self, voice_prompt_path: str | None, text_prompt: str | None):
+        if self._streaming_state is None:
+            return
+        
+        # Clone the exact state of the cache and provided tensors, plus the offset
+        cache_clone = self._streaming_state.cache.clone()
+        provided_clone = self._streaming_state.provided.clone()
+        offset_clone = self._streaming_state.offset
+        
+        self.prewarmed_states[(voice_prompt_path, text_prompt)] = (cache_clone, provided_clone, offset_clone)
+
+    def restore_prewarmed_state(self, voice_prompt_path: str | None, text_prompt: str | None) -> bool:
+        if self._streaming_state is None:
+            return False
+        
+        key = (voice_prompt_path, text_prompt)
+        if key in self.prewarmed_states:
+            cache, provided, offset = self.prewarmed_states[key]
+            self._streaming_state.cache.copy_(cache)
+            self._streaming_state.provided.copy_(provided)
+            self._streaming_state.offset = offset
+            return True
+            
+        return False
 
     async def step_system_prompts_async(self, mimi, is_alive: Optional[Callable]=None):
         await self._step_voice_prompt_async(mimi, is_alive)

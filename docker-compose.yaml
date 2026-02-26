@@ -11,6 +11,9 @@ services:
       - TORCHINDUCTOR_MAX_AUTOTUNE=0
       - TORCHINDUCTOR_COMPILE_THREADS=1
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # Enable NVIDIA MPS (Multi-Process Service) concurrent execution 
+      - CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=80
+    ipc: host
     env_file:
       - .env
     command: ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl", "--host", "0.0.0.0", "--lowvram"]
@@ -26,3 +29,26 @@ services:
               capabilities: [ gpu ]
     volumes:
       - ./.cache:/root/.cache
+
+  moshi-rust:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+    ports:
+      - "8999:8998"
+    environment:
+      # Enable NVIDIA MPS concurrent execution
+      - CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20
+    ipc: host
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+        reservations:
+          memory: 4G
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+    volumes:
+      - ./.cache/huggingface:/root/.cache/huggingface

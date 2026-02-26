@@ -270,15 +270,15 @@ class ServerState:
         try:
             for step in range(1, 5):
                 start_time = time.time()
-                chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
-                logger.info(f"[WARMUP] step={step} input_shape={tuple(chunk.shape)} device={self.device}")
+                chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device="cpu")
+                logger.info(f"[WARMUP] step={step} input_shape={tuple(chunk.shape)} device=cpu")
                 
                 codes = self.mimi.encode(chunk)
                 for c in range(codes.shape[-1]):
-                    tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                    tokens = self.lm_gen.step(codes[:, :, c: c + 1].to(device=self.device))
                     if tokens is None:
                         continue
-                    _ = self.mimi.decode(tokens[:, 1:9])
+                    _ = self.mimi.decode(tokens[:, 1:9].to(device="cpu"))
                 duration = int((time.time() - start_time) * 1000)
                 logger.info("[WARMUP] step=%d completed in %dms", step, duration)
 
@@ -479,7 +479,7 @@ class ServerState:
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
-                    chunk = chunk.to(device=self.device)[None, None]
+                    chunk = chunk.to(device="cpu")[None, None]
                     
                     t0 = time.time()
                     codes = self.mimi.encode(chunk)
@@ -487,7 +487,7 @@ class ServerState:
                     
                     for c in range(codes.shape[-1]):
                         t1 = time.time()
-                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        tokens = self.lm_gen.step(codes[:, :, c: c + 1].to(device=self.device))
                         t_lm = (time.time() - t1) * 1000
                         
                         if tokens is None:
@@ -495,7 +495,7 @@ class ServerState:
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
                         
                         t2 = time.time()
-                        main_pcm = self.mimi.decode(tokens[:, 1:9])
+                        main_pcm = self.mimi.decode(tokens[:, 1:9].to(device="cpu"))
                         t_dec = (time.time() - t2) * 1000
                         
                         main_pcm = main_pcm.cpu()
@@ -554,9 +554,14 @@ class ServerState:
                     return False
                 return True
             # Reuse mimi for encoding voice prompt and then reset it before conversation starts
-            await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+            restored = self.lm_gen.restore_prewarmed_state(voice_prompt_path, text_prompt)
+            if restored:
+                clog.log("info", "restored pre-warmed KV-cache!")
+            else:
+                await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+                clog.log("info", "done with system prompts")
             self.mimi.reset_streaming()
-            clog.log("info", "done with system prompts")
+            
             # Send the handshake.
             if await is_alive():
                 await ws.send_bytes(b"\x00")
@@ -578,7 +583,6 @@ class ServerState:
                         pass
                 await ws.close()
                 clog.log("info", "session closed")
-                # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
         clog.log("info", "done with connection")
         return ws
 
@@ -851,7 +855,7 @@ def main():
     logger.info("loading mimi")
     if args.mimi_weight is None:
         args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME)
-    mimi = loaders.get_mimi(args.mimi_weight, args.device)
+    mimi = loaders.get_mimi(args.mimi_weight, "cpu")
     logger.info("mimi loaded")
     if not check_memory_safeguard():
         logger.error("Memory cap exceeded after loading Mimi. Exiting.")
@@ -894,6 +898,29 @@ def main():
     warmup_ok = state.warmup()
     if not warmup_ok:
         logger.warning("[WARMUP] Warmup skipped or failed; continuing server startup.")
+    elif getattr(args, "prewarm", True):
+        logger.info("[PREWARM] Pre-warming KV-cache for default prompts...")
+        default_voice = None
+        if args.voice_prompt_dir is not None:
+             default_voice_path = os.path.join(args.voice_prompt_dir, "s0.pt")
+             if os.path.exists(default_voice_path):
+                 default_voice = default_voice_path
+        
+        default_text = "You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way."
+        try:
+             # Manually trigger a step just for the cache
+             if default_voice is not None:
+                 state.lm_gen.load_voice_prompt_embeddings(default_voice)
+             state.lm_gen.text_prompt_tokens = state.text_tokenizer.encode(wrap_with_system_tags(default_text))
+             
+             state.mimi.reset_streaming()
+             state.lm_gen.reset_streaming()
+             state.lm_gen.step_system_prompts(state.mimi)
+             state.lm_gen.save_prewarmed_state(default_voice, default_text)
+             logger.info("[PREWARM] Successfully prewarmed cache for default prompts.")
+        except Exception as e:
+             logger.warning(f"[PREWARM] Pre-warming failed: {e}")
+             
     if not check_memory_safeguard():
         logger.error("Memory cap exceeded after warmup. Exiting.")
         sys.exit(1)

@@ -1,0 +1,28 @@
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Rust & dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+RUN git clone https://github.com/kyutai-labs/moshi.git moshi_upstream
+
+WORKDIR /app/moshi_upstream/rust/moshi-backend
+# Build the backend release binary
+RUN cargo build --release
+
+# Re-expose on a different port internally if needed, but we'll bind it in compose
+EXPOSE 8998
+
+# Start the optimized Candle server
+CMD ["cargo", "run", "--release", "--bin", "moshi-backend", "--", "--hf-repo", "kyutai/moshika-candle-q8", "--host", "0.0.0.0", "--port", "8998"]

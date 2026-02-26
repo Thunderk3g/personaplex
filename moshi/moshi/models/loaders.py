@@ -508,6 +508,11 @@ def get_moshi_lm(
             filename, copy_missing_weights, device, dtype, lm_kwargs, gpus or torch.cuda.device_count()
         )
 
+    if filename is not None and str(filename).endswith(".onnx"):
+        return _get_moshi_lm_onnx(
+            filename, copy_missing_weights, device, dtype, lm_kwargs
+        )
+
     logger.info("[MODEL_LOAD] moshi initialized")
     logger.info(f"[MODEL_LOAD] target_device={device}")
     logger.info(f"[MODEL_LOAD] dtype={dtype}")
@@ -525,7 +530,7 @@ def get_moshi_lm(
     # Load and patch state_dict on CPU before moving to the target device.
     state_dict = _load_lm_state_dict(filename, device="cpu")
     model_sd = model.state_dict()
-    state_dict = _patch_lm_state_dict(
+    state_dict = _patch_state_dict(
         state_dict=state_dict,
         model_sd=model_sd,
         copy_missing_weights=copy_missing_weights,
@@ -605,7 +610,7 @@ def _get_moshi_lm_with_offload(
         model = LMModel(device=dev, dtype=dtype, **lm_kwargs)
         model_sd = model.state_dict()
         state_dict = _load_lm_state_dict(filename, device="cpu")
-        state_dict = _patch_lm_state_dict(
+        state_dict = _patch_state_dict(
             state_dict=state_dict,
             model_sd=model_sd,
             copy_missing_weights=copy_missing_weights,
@@ -649,7 +654,7 @@ def _get_moshi_lm_with_offload(
 
     model_sd = model.state_dict()
     state_dict = _load_lm_state_dict(filename, device="cpu")
-    state_dict = _patch_lm_state_dict(
+    state_dict = _patch_state_dict(
         state_dict=state_dict,
         model_sd=model_sd,
         copy_missing_weights=copy_missing_weights,
@@ -730,7 +735,7 @@ def _get_moshi_lm_lowvram(
     # 3. Load state dict on CPU
     state_dict = _load_lm_state_dict(filename, device="cpu")
     model_sd = model.state_dict()
-    state_dict = _patch_lm_state_dict(
+    state_dict = _patch_state_dict(
         state_dict=state_dict,
         model_sd=model_sd,
         copy_missing_weights=copy_missing_weights,
@@ -839,3 +844,52 @@ def _get_moshi_lm_multi_gpu(
 
     model.eval()
     return MultiGPULMModel(model, device_map)
+
+
+def _get_moshi_lm_onnx(
+    filename: str | Path,
+    copy_missing_weights: bool,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    lm_kwargs: dict,
+) -> LMModel:
+    """Load Moshi LM optimized with ONNX Runtime and OpenVINO Heterogeneous Execution."""
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        raise ImportError(
+            "ONNX execution requires the 'onnxruntime' package. "
+            "Install it with: pip install onnxruntime-openvino"
+        )
+
+    filename = str(filename)
+    logger.info(f"[MODEL_LOAD] Loading ONNX model from {filename} with OpenVINO Heterogeneous Execution")
+    
+    # Generate PyTorch stub model
+    model = LMModel(device="meta", dtype=dtype, **lm_kwargs)
+    model.eval()
+    
+    # Setup OpenVINO Heterogeneous properties
+    options = {"device_type": "HETERO:GPU,CPU", "precision": "FP16"}
+    
+    session_options = ort.SessionOptions()
+    session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    providers = [
+        ("OpenVINOExecutionProvider", options),
+        "CPUExecutionProvider"
+    ]
+    
+    logger.info(f"[MODEL_LOAD] Initializing ONNX InferenceSession with providers: {providers}")
+    session = ort.InferenceSession(filename, sess_options=session_options, providers=providers)
+    
+    # Monkeypatching the critical context wrapper
+    model._ort_session = session
+    model._is_offloaded = False
+    
+    def onnx_forward_codes(sequence: torch.Tensor):
+        logger.warning("ONNX _ort_session was invoked but full ONNX forward pass logic needs matching I/O definitions.")
+        raise NotImplementedError("ONNX forward pass signature must be matched to exported inputs.")
+        
+    model.forward_codes = onnx_forward_codes
+    return model
