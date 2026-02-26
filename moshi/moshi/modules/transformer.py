@@ -263,14 +263,14 @@ class RingKVCache:
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
         B, H, T, D = k.shape
-        indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
+        indexes = torch.arange(T, device=k.device, dtype=self.end_offset.dtype) + self.end_offset.to(k.device)
         indexes = indexes % self.capacity
-        self.cache[0].index_copy_(2, indexes, k)
-        self.cache[1].index_copy_(2, indexes, v)
+        self.cache[0].index_copy_(2, indexes.to(self.cache.device), k.to(self.cache.device))
+        self.cache[1].index_copy_(2, indexes.to(self.cache.device), v.to(self.cache.device))
         self.end_offset.add_(T)
 
-        keys = self.cache[0]
-        values = self.cache[1]
+        keys = self.cache[0].to(k.device)
+        values = self.cache[1].to(k.device)
 
         indexes = torch.arange(
             self.capacity, device=self.end_offset.device, dtype=torch.long
@@ -425,7 +425,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         k, v, pos_k = self._complete_kv(k, v)
         if self.causal:
             pos_k = pos_k.view(1, -1)
-            pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(
+            pos_q = offset.to(q.device) + torch.arange(T, device=q.device, dtype=torch.long).view(
                 -1, 1
             )
             delta = pos_q - pos_k
@@ -706,7 +706,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
 
         if self.positional_embedding in {"sin", "sin_rope"}:
             positions = torch.arange(T, device=x.device).view(1, -1, 1)
-            positions = positions + offset.view(-1, 1, 1)
+            positions = positions + offset.to(x.device).view(-1, 1, 1)
             pos_emb = create_sin_embedding(
                 positions, C, max_period=self.max_period, dtype=x.dtype
             )

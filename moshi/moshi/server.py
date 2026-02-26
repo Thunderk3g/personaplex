@@ -274,18 +274,18 @@ class ServerState:
                 logger.info(f"[WARMUP] step={step} input_shape={tuple(chunk.shape)} device={self.device}")
                 
                 codes = self.mimi.encode(chunk)
-                _ = self.other_mimi.encode(chunk)
                 for c in range(codes.shape[-1]):
                     tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                     if tokens is None:
                         continue
                     _ = self.mimi.decode(tokens[:, 1:9])
-                    _ = self.other_mimi.decode(tokens[:, 1:9])
                 duration = int((time.time() - start_time) * 1000)
                 logger.info("[WARMUP] step=%d completed in %dms", step, duration)
 
             if torch.device(self.device).type == 'cuda':
-                torch.cuda.synchronize()
+                # Synchronize all available CUDA devices
+                for i in range(torch.cuda.device_count()):
+                    torch.cuda.synchronize(i)
             return True
         except Exception:
             logger.exception("[WARMUP] Fatal error during warmup.")
@@ -501,8 +501,11 @@ class ServerState:
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         
-                        if random.random() < 0.02: # Log ~once per 4 seconds (12.5 fps)
-                             clog.log("info", f"Step Latency: {t_enc:.1f}ms (enc) | {t_lm:.1f}ms (lm) | {t_dec:.1f}ms (dec) | Total: {(time.time()-be)*1000:.1f}ms")
+                        t_step = (time.time() - be) * 1000
+                        if t_step > 80:
+                             clog.log("warning", f"Latency spike: {t_step:.1f}ms (enc: {t_enc:.1f}, lm: {t_lm:.1f}, dec: {t_dec:.1f})")
+                        elif random.random() < 0.02: # Log ~once per 4 seconds (12.5 fps)
+                             clog.log("info", f"Step Latency: {t_enc:.1f}ms (enc) | {t_lm:.1f}ms (lm) | {t_dec:.1f}ms (dec) | Total: {t_step:.1f}ms")
                         
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
@@ -535,7 +538,6 @@ class ServerState:
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
             self.mimi.reset_streaming()
-            self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             async def is_alive():
                 if close or ws.closed:
@@ -727,6 +729,17 @@ def main():
         action="store_true",
         help="Use 4-bit quantization via bitsandbytes to reduce VRAM usage.",
     )
+    parser.add_argument(
+        "--multi-gpu",
+        action="store_true",
+        help="Enable layer-sharded model parallelism across multiple GPUs.",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs to use for multi-GPU mode (defaults to all available).",
+    )
 
     args = parser.parse_args()
     if args.max_cpu_threads is not None and args.max_cpu_threads < 1:
@@ -839,7 +852,6 @@ def main():
     if args.mimi_weight is None:
         args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME)
     mimi = loaders.get_mimi(args.mimi_weight, args.device)
-    other_mimi = loaders.get_mimi(args.mimi_weight, args.device)
     logger.info("mimi loaded")
     if not check_memory_safeguard():
         logger.error("Memory cap exceeded after loading Mimi. Exiting.")
@@ -855,8 +867,11 @@ def main():
     lm = loaders.get_moshi_lm(
         args.moshi_weight,
         device=args.device,
+        dtype=torch.bfloat16,
         cpu_offload=args.cpu_offload,
         lowvram=args.lowvram,
+        multi_gpu=args.multi_gpu,
+        gpus=args.gpus,
     )
     lm.eval()
     logger.info("moshi loaded")
@@ -865,7 +880,6 @@ def main():
         sys.exit(1)
     state = ServerState(
         mimi=mimi,
-        other_mimi=other_mimi,
         text_tokenizer=text_tokenizer,
         lm=lm,
         device=args.device,

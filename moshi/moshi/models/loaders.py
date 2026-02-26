@@ -169,7 +169,7 @@ def _repeat_first_dim_to_shape(
     return expanded[: target_shape[0]].clone()
 
 
-def _patch_lm_state_dict(
+def _patch_state_dict(
     state_dict: dict[str, torch.Tensor],
     model_sd: dict[str, torch.Tensor],
     copy_missing_weights: bool,
@@ -219,6 +219,80 @@ def _patch_lm_state_dict(
             logger.info("Replacing %s <- %s", name, source_name)
 
     return state_dict
+
+
+class MultiGPULMModel(transformer.StreamingContainer):
+    """Wrapper for LMModel that shards transformer layers across multiple GPUs."""
+    def __init__(self, model: LMModel, device_map: dict[str, int]):
+        super().__init__()
+        self._model = model
+        self._device_map = device_map
+        self._is_multi_gpu = True
+        self._depformer_device = torch.device(f"cuda:{max(device_map.values())}")
+        self._primary_device = torch.device("cuda:0")
+        
+        # Setup streams and events for sync
+        self._gpu_streams = {str(i): torch.cuda.Stream(device=i) for i in set(device_map.values())}
+        self._boundary_events = {str(i): torch.cuda.Event(enable_timing=False, interprocess=False) for i in set(device_map.values())}
+
+    @property
+    def device(self):
+        return self._primary_device
+
+    def __getattr__(self, name):
+        if name in ["_model", "_device_map", "_is_multi_gpu", "_depformer_device", "_primary_device", "_gpu_streams", "_boundary_events"]:
+            return super().__getattr__(name)
+        return getattr(self._model, name)
+
+    def parameters(self, recurse=True):
+        # We ensure embeddings (on cuda:0) are returned first
+        return self._model.parameters(recurse=recurse)
+
+    def embed_codes(self, sequence: torch.Tensor) -> torch.Tensor:
+        return self._model.embed_codes(sequence.to(self._primary_device))
+
+    def forward_embeddings(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = input
+        current_device = x.device
+        
+        # We need to manually iterate over transformer layers to handle transitions
+        x = self._model.transformer.input_proj(x) if self._model.transformer.input_proj else x
+        
+        for i, layer in enumerate(self._model.transformer.transformer.layers):
+            target_device_idx = self._device_map[f"layers.{i}"]
+            target_device = torch.device(f"cuda:{target_device_idx}")
+            
+            if target_device != current_device:
+                # Synchronization boundary
+                prev_dev_str = str(current_device.index)
+                target_dev_str = str(target_device_idx)
+                
+                with torch.cuda.stream(self._gpu_streams[prev_dev_str]):
+                    self._boundary_events[prev_dev_str].record()
+                
+                with torch.cuda.stream(self._gpu_streams[target_dev_str]):
+                    self._gpu_streams[target_dev_str].wait_event(self._boundary_events[prev_dev_str])
+                    x = x.to(target_device, non_blocking=True)
+                
+                current_device = target_device
+                
+            with torch.cuda.stream(self._gpu_streams[str(current_device.index)]):
+                x = layer(x)
+        
+        # Wait for last GPU to finish transformer before out_norm/linear
+        torch.cuda.current_stream().wait_stream(self._gpu_streams[str(current_device.index)])
+        
+        if self._model.out_norm:
+            x = self._model.out_norm(x)
+        text_logits = self._model.text_linear(x)
+        text_logits = text_logits[:, None]
+        return x, text_logits
+
+    def forward_depformer(self, cb_index, sequence, transformer_out, skip_transfer=False):
+        if not skip_transfer:
+            sequence = sequence.to(self._depformer_device, non_blocking=True)
+            transformer_out = transformer_out.to(self._depformer_device, non_blocking=True)
+        return self._model.forward_depformer(cb_index, sequence, transformer_out)
 
 
 def _find_parent_real_device(model: torch.nn.Module, parent_name: str) -> torch.device | None:
@@ -390,8 +464,6 @@ def get_mimi(filename: str | Path,
         model.load_state_dict(pkg["model"])
     model.set_num_codebooks(8)
     return model
-
-
 def get_moshi_lm(
     filename: str | Path | None,
     copy_missing_weights: bool = True,
@@ -400,6 +472,8 @@ def get_moshi_lm(
     delays=None,
     cpu_offload: bool = False,
     lowvram: bool = False,
+    multi_gpu: bool = False,
+    gpus: int | None = None,
 ) -> LMModel:
     """Return a pretrained Moshi LM model.
 
@@ -424,9 +498,14 @@ def get_moshi_lm(
             filename, copy_missing_weights, device, dtype, lm_kwargs
         )
 
-    if cpu_offload and filename is not None:
+    if cpu_offload and filename is not None and not multi_gpu:
         return _get_moshi_lm_with_offload(
             filename, copy_missing_weights, device, dtype, lm_kwargs
+        )
+
+    if multi_gpu and filename is not None:
+        return _get_moshi_lm_multi_gpu(
+            filename, copy_missing_weights, device, dtype, lm_kwargs, gpus or torch.cuda.device_count()
         )
 
     logger.info("[MODEL_LOAD] moshi initialized")
@@ -688,3 +767,75 @@ def _get_moshi_lm_lowvram(
     model.eval()
     model._is_offloaded = False
     return model
+def _get_moshi_lm_multi_gpu(
+    filename: str | Path,
+    copy_missing_weights: bool,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    lm_kwargs: dict,
+    num_gpus: int,
+) -> MultiGPULMModel:
+    """Load Moshi LM distributed across multiple GPUs."""
+    filename = str(filename)
+    logger.info(f"[MODEL_LOAD] Loading model sharded across {num_gpus} GPUs")
+
+    # 1. Create model on CPU first
+    model = LMModel(device="cpu", dtype=dtype, **lm_kwargs)
+    
+    # 2. Load and patch state dict on CPU
+    state_dict = _load_lm_state_dict(filename, device="cpu")
+    model_sd = model.state_dict()
+    state_dict = _patch_state_dict(
+        state_dict=state_dict,
+        model_sd=model_sd,
+        copy_missing_weights=copy_missing_weights,
+    )
+
+    # 3. Calculate layer sharding
+    num_layers = lm_kwargs["num_layers"]
+    # Simple even split for now, can be tuned with depformer_cost_ratio later
+    layers_per_gpu = (num_layers + num_gpus - 1) // num_gpus
+    
+    device_map = {}
+    for i in range(num_layers):
+        gpu_idx = min(i // layers_per_gpu, num_gpus - 1)
+        device_map[f"layers.{i}"] = gpu_idx
+        
+    logger.info(f"Layer sharding: {device_map}")
+
+    # 4. Move layers to GPUs
+    for i in range(num_layers):
+        gpu_idx = device_map[f"layers.{i}"]
+        model.transformer.transformer.layers[i].to(device=f"cuda:{gpu_idx}", dtype=dtype)
+    
+    # Text/Audio embeddings on cuda:0
+    model.text_emb.to(device="cuda:0", dtype=dtype)
+    for emb in model.emb:
+        emb.to(device="cuda:0", dtype=dtype)
+    if model.transformer.input_proj:
+        model.transformer.input_proj.to(device="cuda:0", dtype=dtype)
+        
+    # Depformer and output heads on the last GPU
+    last_gpu = f"cuda:{num_gpus - 1}"
+    model.depformer.to(device=last_gpu, dtype=dtype)
+    model.out_norm.to(device=last_gpu, dtype=dtype)
+    model.text_linear.to(device=last_gpu, dtype=dtype)
+    for head in model.linears:
+        head.to(device=last_gpu, dtype=dtype)
+    for emb in model.depformer_emb:
+        emb.to(device=last_gpu, dtype=dtype)
+    model.depformer_text_emb.to(device=last_gpu, dtype=dtype)
+    for d_in in model.depformer_in:
+        d_in.to(device=last_gpu, dtype=dtype)
+
+    # 5. Load patched state_dict (strict=False because we sharded manually)
+    model.load_state_dict(state_dict, strict=False, assign=True)
+    
+    _materialize_meta_tensors(
+        model=model,
+        target_device=torch.device("cpu"),
+        copy_missing_weights=copy_missing_weights,
+    )
+
+    model.eval()
+    return MultiGPULMModel(model, device_map)

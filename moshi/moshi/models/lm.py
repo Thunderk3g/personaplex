@@ -737,8 +737,9 @@ class LMGen(StreamingModule[_LMGenState]):
         )
 
         disable = lm_model.device.type != 'cuda' or getattr(lm_model, '_is_offloaded', False)
-        graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable)
-        graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
+        disable_cross_device = disable or getattr(lm_model, '_is_multi_gpu', False)
+        graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable_cross_device)
+        graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable_cross_device)
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
 
         return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth)
@@ -911,10 +912,22 @@ class LMGen(StreamingModule[_LMGenState]):
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
+        # Pre-transfer inputs to depformer device BEFORE calling the graphed function
+        depformer_device = getattr(lm_model, '_depformer_device', lm_model.device)
+        transformer_out_dep = transformer_out.to(depformer_device, non_blocking=True)
+        target_dep = target_[:, lm_model.audio_offset:, 0].to(depformer_device, non_blocking=True)
+        provided_dep = provided_[:, lm_model.audio_offset:, 0].to(depformer_device, non_blocking=True)
+        next_text_token_dep = next_text_token.to(depformer_device, non_blocking=True)
+
         if self.return_logits:
-            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
+            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token_dep, transformer_out_dep, target_dep, provided_dep) # [B, K_audio, Card_audio]
         else:
-            sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
+            sampled_audio_tokens = state.graphed_depth(next_text_token_dep, transformer_out_dep, target_dep, provided_dep)
+
+        # Move results back to primary device
+        sampled_audio_tokens = sampled_audio_tokens.to(lm_model.device, non_blocking=True)
+        if self.return_logits:
+            audio_logits = audio_logits.to(lm_model.device, non_blocking=True)
 
         state.provided[:, :, model_input_position] = False
         ####
@@ -1151,8 +1164,14 @@ class LMGen(StreamingModule[_LMGenState]):
         text_token: torch.Tensor,
         transformer_out: torch.Tensor,
         audio_tokens: torch.Tensor,
-        audio_provided: torch.Tensor
+        audio_provided: torch.Tensor,
+        skip_transfer: bool = False,
     ) -> torch.Tensor:
+        """One step of the depformer.
+        
+        Args:
+            skip_transfer: If True, assume all inputs are already on the correct device.
+        """
         (B,) = text_token.shape
         prev_token = text_token
         lm_model = self.lm_model
@@ -1162,7 +1181,7 @@ class LMGen(StreamingModule[_LMGenState]):
         with lm_model.depformer.streaming(B):
             for cb_index in range(lm_model.dep_q):
                 input_ = prev_token[:, None, None]
-                logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
+                logits = lm_model.forward_depformer(cb_index, input_, transformer_out, skip_transfer=skip_transfer)
                 if self.return_logits:
                     assert logits.shape == (B, 1, 1, lm_model.card), logits.shape
                     ret_logits = logits.squeeze(dim=1).squeeze(dim=1)

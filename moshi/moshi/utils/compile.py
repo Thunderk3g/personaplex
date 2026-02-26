@@ -277,6 +277,13 @@ def no_cuda_graph():
         _disable_cuda_graph = old_value
 
 
+def _get_device_from_args(args: tuple) -> torch.device | None:
+    for arg in args:
+        if isinstance(arg, torch.Tensor) and arg.is_cuda:
+            return arg.device
+    return None
+
+
 class CUDAGraphed:
     """Allow simple CUDA Graphing of a function.
 
@@ -352,14 +359,24 @@ class CUDAGraphed:
             # Prevent any one under us to try and CUDA Graph things.
             if self._graph is None:
                 if self.warmup_steps <= 0:
-                    self._graph = cuda.CUDAGraph()
-                    # Making a copy just to ensure those are not used else where.
-                    self._args = _clone_tensors(args)
-                    with cuda.graph(self._graph):
-                        self._output = self.func(*self._args)
-                    # At this point nothing really happened, so we have to make it run for real.
-                    self._graph.replay()
-                    return self._output
+                    device = _get_device_from_args(args)
+                    if device is None:
+                        # Fallback if no CUDA tensors
+                        return self.func(*args)
+                    
+                    with torch.cuda.device(device):
+                        self._graph = cuda.CUDAGraph()
+                        # Making a copy just to ensure those are not used else where.
+                        self._args = _clone_tensors(args)
+                        
+                        # Pre-capture synchronization
+                        cuda.current_stream(device).synchronize()
+                        
+                        with cuda.graph(self._graph):
+                            self._output = self.func(*self._args)
+                        # At this point nothing really happened, so we have to make it run for real.
+                        self._graph.replay()
+                        return self._output
                 else:
                     self.warmup_steps -= 1
                     return self.func(*args)
